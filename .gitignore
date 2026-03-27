@@ -1,0 +1,17 @@
+# R / Posit
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+.quarto/
+*.html
+*_files/
+outputs/
+
+# renv
+renv/library/
+renv/python/
+!renv/activate.R
+!renv/settings.json
+!renv/.gitignore
+!renv.lock
