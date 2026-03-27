@@ -1,0 +1,59 @@
+# HAVI QSR Forecasting Hackathon 2026 — Shared AI Context
+
+## Project objective
+We are competing in the HAVI / NIU Quick Service Restaurant (QSR) Demand Forecasting Challenge. The task is to forecast daily demand (`quantity`) for each restaurant-item combination for the holdout period from **2025-10-01 through 2025-12-31**. The final prediction file must contain **69,000 rows** with columns:
+
+- `date`
+- `restaurant_id`
+- `menu_item_id`
+- `predicted_quantity`
+
+The competition uses **wMAPE (weighted mean absolute percentage error)** for forecast accuracy. Lower is better. The top 10 teams by accuracy advance, and finalists are then judged on methodology, innovation, documentation, reproducibility, video, and presentation.
+
+## Dataset summary
+The dataset contains about **1.37 million rows** of daily observations from **2021 through 2025** across:
+
+- **15 restaurants**
+- **50 menu items**
+- multiple Midwest locations
+
+Each row is a daily item-level demand observation for a specific restaurant and menu item.
+
+### Key columns
+- Time: `date`, `day_of_week`, `day_of_week_num`, `month`, `year`, `is_weekend`
+- Location: `restaurant_id`, `restaurant_name`, `city`, `state`
+- Item: `menu_item_id`, `menu_item_name`, `category`, `unit_price`
+- Target: `quantity`
+- Weather: `avg_temp_f`, `precip_inches`, `precip_type`
+- Calendar/events: `is_holiday`, `holiday_name`, `is_special_event`, `special_event_name`
+- Promotions: `is_promotion`
+
+## Team composition
+We are a 3-person team with complementary strengths.
+
+## Practical constraints
+- This is a **72-hour hackathon sprint**, so speed and coordination matter more than building a perfect production system.
+- We have unrestricted AI access and want to use it as a coding and reasoning copilot.
+- Reproducibility matters, so the workflow must be organized and documented.
+- We should avoid duplicated effort unless we are intentionally benchmarking alternative approaches.
+
+## Core strategy
+The goal is not to guess the single “right” model in advance. The goal is to build a disciplined process that:
+
+1. establishes a strong baseline,
+2. engineers useful time-aware features,
+3. compares a small number of sensible models,
+4. uses time-based validation,
+5. selects the best approach for the holdout forecast,
+6. documents the logic clearly.
+
+## Non-negotiables
+Any AI assistant helping us should follow these rules.
+
+1. **Do not leak future information into training features.**
+2. **Use time-based validation**, not random train/test splits.
+3. **Optimize for wMAPE**, not generic accuracy.
+4. **Prefer robust, interpretable, reproducible workflows** over flashy but fragile methods.
+5. **Do not overengineer deep learning** unless it clearly beats simpler approaches in validation.
+6. **Keep outputs standardized** so R and Python workstreams can interoperate.
+7. **Document assumptions and tradeoffs** as we go.
