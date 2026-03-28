@@ -7,6 +7,8 @@
 *.html
 *_files/
 outputs/
+.venv/
+.ipynb_checkpoints/
 
 # renv
 renv/library/
