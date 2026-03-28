@@ -17,3 +17,6 @@ renv/python/
 !renv/settings.json
 !renv/.gitignore
 !renv.lock
+
+.DS_Store
+docs/.DS_Store
