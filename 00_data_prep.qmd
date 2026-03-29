@@ -23,24 +23,32 @@ library(lubridate)
 
 ## Purpose
 
-This notebook is the **single source of truth** for all data preparation.
-It runs once and writes standardized files to `data/` that every model
-notebook loads directly. Nothing downstream touches raw data or recomputes
-splits.
+## Model Lineage & Design Scope
 
-**What this script produces:**
+This notebook is the data layer for **Mario's R experiment only**.
+It is intentionally independent from Anthony's Python model.
 
-| File | Description |
-|---|---|
-| `data/val.csv` | Sep 2025 — fixed, never changes |
-| `data/test.csv` | Oct–Dec 2025 — fixed, never changes |
-| `data/train_dropped.csv` | Training rows with null quantity dropped |
-| `data/train_imputed_combo_median.csv` | Null quantity filled with combo (restaurant × item) median |
-| `data/train_imputed_dow_median.csv` | Null quantity filled with same day-of-week median per combo |
+| | Mario's R model (this repo) | Anthony's Python V1 | Final ensemble / best submission |
+|---|---|---|---|
+| Language | R / tidymodels + bonsai | Python / LightGBM native | — |
+| Min lag horizon | 7 days (anchored at lag-7) | 92 days (= full forecast window) | — |
+| Lag set | lag_7/14/21/28/364 | lag_92 … lag_357/364 (38 weekly lags) | — |
+| Extra features | unit_price, R09 interactions, Drinks × temp/weekend | — | — |
+| Sample weights | 1 + sqrt(quantity) | None | — |
+| Specials override | Yes (val-gated) | No | — |
 
-Val and test **always score against real quantities** — the dataset contains
-actuals through Dec 31 2025. The training variant is the only variable
-you change when comparing models.
+**Lag design note:** Mario's lags are anchored at 7 days, not 92. This is
+valid for training and val (Sep 2025) because those rows are isolated splits
+with no look-ahead — `lag_7` on a Sep row pulls from Aug, which is history.
+It is also fine for test (Oct–Dec) because `00_data_prep.qmd` computes lags
+from `raw_train` history only; test features are joined, not computed
+on live test-period actuals.
+
+The tradeoff: shorter lags capture more recent demand signal and react to
+recent trends faster. The cost is those features are unavailable for
+true multi-step production forecasting beyond a 7-day horizon without
+recursive filling. For this competition (batch forecast, all history known
+through Aug 31), it is leakage-free.
 
 ---
 
@@ -130,7 +138,32 @@ add_calendar_features <- function(df) {
       sin_dow   = sin(2 * pi * day_of_week_num / 7),
       cos_dow   = cos(2 * pi * day_of_week_num / 7)
     ) |>
-    select(-days_in_month)
+    select(-days_in_month) |>
+    # ── Weather breakdown ──────────────────────────────────────────────────────
+    mutate(
+      temp_bin    = cut(avg_temp_f, breaks = c(-Inf, 32, 55, 75, Inf),
+                        labels = c(0, 1, 2, 3)) |> as.numeric(),
+      has_precip  = as.integer(precip_inches > 0),
+      is_snow     = as.integer(precip_type == "Snow"),
+      is_rain     = as.integer(precip_type == "Rain"),
+      # ── Interaction features ──────────────────────────────────────────────
+      promo_x_weekend = is_promotion      * is_weekend,
+      event_x_weekend = is_special_event  * is_weekend,
+      # ── Numeric encodings ─────────────────────────────────────────────────
+      category_enc    = as.integer(as.factor(category))      - 1L,
+      state_enc       = as.integer(as.factor(state))         - 1L,
+      day_of_week_enc = as.integer(as.factor(day_of_week))   - 1L,
+      restaurant_enc  = as.integer(as.factor(restaurant_id)) - 1L,
+      item_enc        = as.integer(as.factor(menu_item_id))  - 1L,
+      # ── R09 identity + interactions (R09 is persistent outlier) ───────────
+      is_r09             = as.integer(restaurant_id == "R09"),
+      r09_x_special_event = as.integer(restaurant_id == "R09") * is_special_event,
+      r09_x_promotion    = as.integer(restaurant_id == "R09") * is_promotion,
+      # ── Drinks targeted features (highest volume, most weather-reactive) ──
+      is_drinks          = as.integer(category == "Drinks"),
+      drinks_x_temp      = as.integer(category == "Drinks") * avg_temp_f,
+      drinks_x_weekend   = as.integer(category == "Drinks") * is_weekend
+    )
 }
 
 df_cal <- df_raw |> add_calendar_features()
@@ -157,6 +190,10 @@ add_lag_features <- function(df) {
     group_by(restaurant_id, menu_item_id) |>
     mutate(
       # ── Point lags ──────────────────────────────────────────────────────────
+      # Rolling windows are anchored at lag-7 (most recent 7 days excluded).
+      # This is leakage-free for training and val rows because those splits are
+      # isolated before feature computation. Test rows receive features joined
+      # from training history — lag_7 on a test row does NOT see test-period actuals.
       lag_7   = lag(quantity, 7),
       lag_14  = lag(quantity, 14),
       lag_21  = lag(quantity, 21),
@@ -178,6 +215,22 @@ add_lag_features <- function(df) {
                        (\(x) zoo::rollmeanr(x, k = 14, fill = NA, na.rm = TRUE))(),
       roll_mean_28 = lag(quantity, 7) |>
                        (\(x) zoo::rollmeanr(x, k = 28, fill = NA, na.rm = TRUE))(),
+      roll_std_7   = lag(quantity, 7) |>
+                       (\(x) zoo::rollapply(x, width = 7,  FUN = sd,
+                                            fill = NA, align = "right",
+                                            na.rm = TRUE))(),
+      roll_max_7   = lag(quantity, 7) |>
+                       (\(x) zoo::rollapply(x, width = 7,  FUN = max,
+                                            fill = NA, align = "right",
+                                            na.rm = TRUE))(),
+      roll_std_14  = lag(quantity, 7) |>
+                       (\(x) zoo::rollapply(x, width = 14, FUN = sd,
+                                            fill = NA, align = "right",
+                                            na.rm = TRUE))(),
+      roll_max_14  = lag(quantity, 7) |>
+                       (\(x) zoo::rollapply(x, width = 14, FUN = max,
+                                            fill = NA, align = "right",
+                                            na.rm = TRUE))(),
       roll_std_28  = lag(quantity, 7) |>
                        (\(x) zoo::rollapply(x, width = 28, FUN = sd,
                                             fill = NA, align = "right",
@@ -256,16 +309,30 @@ FEATURES <- c(
   "sin_dow",   "cos_dow",
   # Lags
   "lag_7", "lag_14", "lag_21", "lag_28", "lag_364",
-  # Rolling (anchored at lag-7)
+  # Rolling means (anchored at lag-7)
   "roll_mean_7", "roll_mean_14", "roll_mean_28",
-  "roll_std_28", "roll_max_28",
+  # Rolling std — variability / volatility signal
+  "roll_std_7", "roll_std_14", "roll_std_28",
+  # Rolling max — spike signal
+  "roll_max_7", "roll_max_14", "roll_max_28",
   # Same day-of-week
   "same_dow_lag1", "same_dow_lag2", "same_dow_lag3", "same_dow_mean",
   # Seasonal baseline
   "prior_year_avg", "combo_mean",
   # Exogenous — known at prediction time
   "unit_price", "avg_temp_f", "precip_inches",
-  "is_holiday", "is_special_event", "is_promotion"
+  "is_holiday", "is_special_event", "is_promotion",
+  # Weather breakdown
+  "temp_bin", "has_precip", "is_snow", "is_rain",
+  # Interaction features
+  "promo_x_weekend", "event_x_weekend",
+  # Numeric encodings
+  "category_enc", "state_enc", "day_of_week_enc",
+  "restaurant_enc", "item_enc",
+  # R09 identity + interactions
+  "is_r09", "r09_x_special_event", "r09_x_promotion",
+  # Drinks targeted features
+  "is_drinks", "drinks_x_temp", "drinks_x_weekend"
 )
 
 TARGET <- "quantity"
@@ -305,12 +372,11 @@ val_feats   <- df_feats |> filter(date >= VAL_START,   date <= VAL_END)
 test_feats  <- df_feats |> filter(date >= TEST_START,  date <= TEST_END)
 
 # ── Strategy 1: Drop null quantity rows ───────────────────────────────────────
-# Cleanest for lag features — no synthetic values ever enter the feature columns
+# Cleanest for lag features — no synthetic values ever enter the feature columns.
+# lag_364 NaN rows (first year of history) are kept — LightGBM handles NaN
+# natively and the "no full-year history" signal is informative, not noise.
 train_dropped <- train_feats |>
   filter(!is.na(quantity)) |>
-  # Also drop lag warm-up period where lag_364 is still NA
-  # (first ~364 days per combo have no full-year lookback)
-  filter(!is.na(lag_364)) |>
   cap_outliers()
 
 cat("train_dropped:   ", nrow(train_dropped), "rows |",
@@ -327,7 +393,6 @@ train_imputed_combo <- train_feats |>
   left_join(combo_median_fill, by = c("restaurant_id", "menu_item_id")) |>
   mutate(quantity = coalesce(quantity, combo_median)) |>
   select(-combo_median) |>
-  filter(!is.na(lag_364)) |>
   cap_outliers()
 
 cat("train_imputed_combo:", nrow(train_imputed_combo), "rows |",
@@ -345,7 +410,6 @@ train_imputed_dow <- train_feats |>
             by = c("restaurant_id", "menu_item_id", "day_of_week_num")) |>
   mutate(quantity = coalesce(quantity, dow_median)) |>
   select(-dow_median) |>
-  filter(!is.na(lag_364)) |>
   cap_outliers()
 
 cat("train_imputed_dow:  ", nrow(train_imputed_dow), "rows |",
@@ -412,7 +476,7 @@ cat("  prep_config.rds                 → feature list + date config\n")
 
 Every model notebook in `models/` starts with exactly this:
 
-```r
+```{r}
 # ── Load standardized splits ──────────────────────────────────────────────────
 cfg   <- readRDS("data/prep_config.rds")
 val   <- read_csv("data/val.csv",   show_col_types = FALSE)

@@ -1,0 +1,491 @@
+---
+title: "02 — LightGBM"
+author: "Mario"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+library(tidyverse)
+library(tidymodels)
+library(bonsai)
+library(lightgbm)
+library(scales)
+library(glue)
+library(patchwork)
+```
+
+---
+
+## Purpose
+
+Fits LightGBM against **all three training variants** from
+`00_data_prep.qmd` in a single render. No manual commenting or
+uncommenting required — a loop handles everything.
+
+All three variants share identical features, model spec, wMAPE function,
+and val/test splits. Any difference in wMAPE is attributable to the null
+strategy alone.
+
+---
+
+## 1. Load Config, Val & Test
+
+Val and test never change across variants — load them once here.
+
+```{r}
+#| label: load-fixed-splits
+
+cfg  <- readRDS("data/prep_config.rds")
+val  <- read_csv("data/val.csv",  show_col_types = FALSE)
+test <- read_csv("data/test.csv", show_col_types = FALSE)
+
+FEATURES <- cfg$FEATURES
+TARGET   <- cfg$TARGET
+
+CAT_COLS <- c("restaurant_id", "menu_item_id", "category",
+              "restaurant_name", "city", "state")
+
+glue("Val rows : {nrow(val)}")
+glue("Test rows: {nrow(test)}")
+glue("Features : {length(FEATURES)}")
+```
+
+---
+
+## 2. wMAPE Helper
+
+```{r}
+#| label: wmape-helper
+
+wmape <- function(actual, predicted) {
+  mask <- !is.na(actual) & actual > 0
+  sum(abs(actual[mask] - predicted[mask])) / sum(actual[mask])
+}
+
+score_wmape <- function(df) {
+  wmape(df[[TARGET]], df$predicted)
+}
+```
+
+---
+
+## 3. Baseline Reference
+
+Computed once — identical regardless of training variant.
+
+```{r}
+#| label: baseline-reference
+
+val_baseline_wmape <- val |>
+  mutate(predicted = coalesce(prior_year_avg, combo_mean) |> pmax(0)) |>
+  score_wmape()
+
+test_baseline_wmape <- test |>
+  mutate(predicted = coalesce(prior_year_avg, combo_mean) |> pmax(0)) |>
+  score_wmape()
+
+glue("Baseline (prior_year_avg) — Val: {percent(val_baseline_wmape, accuracy = 0.01)} | Test: {percent(test_baseline_wmape, accuracy = 0.01)}")
+```
+
+---
+
+## 4. Model Spec
+
+Defined once, reused for every variant.
+
+```{r}
+#| label: model-spec
+
+lgbm_spec <- boost_tree(
+  trees          = 1000,
+  tree_depth     = 6,
+  min_n          = 80,
+  learn_rate     = 0.04,
+  loss_reduction = 0.2,
+  sample_size    = 0.9,
+  mtry           = 0.85
+) |>
+  set_engine(
+    "lightgbm",
+    objective    = "regression_l1",
+    num_leaves   = 127,
+    lambda_l2    = 0.8,
+    bagging_freq = 1,
+    seed         = 42,
+    num_threads  = 0,
+    verbosity    = -1,
+    counts       = FALSE
+  ) |>
+  set_mode("regression")
+```
+
+---
+
+## 5. Fit All Three Variants
+
+Each iteration loads training data → builds recipe → log-transforms
+target → fits model → predicts val and test → scores wMAPE → saves
+submission CSV. Results accumulate into `all_results`.
+
+```{r}
+#| label: fit-all-variants
+
+VARIANTS <- tribble(
+  ~label,          ~path,
+  "dropped",       "data/train_dropped.csv",
+  "imputed_combo", "data/train_imputed_combo_median.csv",
+  "imputed_dow",   "data/train_imputed_dow_median.csv"
+)
+
+all_results    <- tibble()
+all_val_scored <- tibble()
+best_model_fit <- NULL   # holds dropped-nulls fit for diagnostics
+
+for (i in seq_len(nrow(VARIANTS))) {
+
+  v_label <- VARIANTS$label[i]
+  v_path  <- VARIANTS$path[i]
+
+  cat(glue("\n── Variant {i}/3: {v_label} ──────────────────────────\n"))
+
+  # ── Load ─────────────────────────────────────────────────────────────────
+  train <- read_csv(v_path, show_col_types = FALSE)
+  cat(glue("   Train rows : {nrow(train)}\n"))
+
+  # ── Recipe ───────────────────────────────────────────────────────────────
+  lgbm_recipe <- recipe(
+      as.formula(paste(TARGET, "~ .")),
+      data = train |> select(all_of(c(TARGET, FEATURES, CAT_COLS)))
+    ) |>
+    step_mutate(across(all_of(CAT_COLS), as.factor))
+    # Note: step_impute_median intentionally removed — LightGBM handles NaN
+    # natively via use_missing=TRUE (default). NaN in lag_364 means
+    # "less than one year of history" — that is signal, not noise.
+
+  lgbm_prep   <- prep(lgbm_recipe, training = train)
+  train_baked <- bake(lgbm_prep, new_data = train)
+  val_baked   <- bake(lgbm_prep, new_data = val)
+  test_baked  <- bake(lgbm_prep, new_data = test)
+
+  # ── Log-transform target + volume-aware sample weights ──────────────────
+  # Upweight high-volume rows so the model optimises closer to wMAPE.
+  # Weight formula mirrors the Python benchmark: 1 + sqrt(quantity).
+  # Using fit_xy() to keep case_wt separate from the predictor matrix —
+  # the formula interface (quantity ~ .) would treat case_wt as a feature.
+  train_log <- train_baked |>
+    mutate(quantity = log1p(quantity))
+
+  x_train <- train_log |> select(-all_of(TARGET))
+  y_train <- train_log[[TARGET]]
+  wts     <- hardhat::importance_weights(1 + sqrt(pmax(y_train, 0)))
+
+  # ── Fit ──────────────────────────────────────────────────────────────────
+  cat(glue("   Fitting...\n"))
+  lgbm_fit <- lgbm_spec |>
+    fit_xy(x = x_train, y = y_train, case_weights = wts)
+  cat(glue("   Done.\n"))
+
+  # ── Predict & back-transform ─────────────────────────────────────────────
+  val_preds <- predict(lgbm_fit,
+                       new_data = val_baked |> select(-all_of(TARGET))) |>
+    mutate(.pred = pmax(expm1(.pred), 0))
+
+  test_preds <- predict(lgbm_fit,
+                        new_data = test_baked |> select(-all_of(TARGET))) |>
+    mutate(.pred = pmax(expm1(.pred), 0))
+
+  val_scored  <- val  |> mutate(predicted = val_preds$.pred,  variant = v_label)
+  test_scored <- test |> mutate(predicted = test_preds$.pred, variant = v_label)
+
+  # ── Score ─────────────────────────────────────────────────────────────────
+  wm_val  <- score_wmape(val_scored)
+  wm_test <- score_wmape(test_scored)
+
+  cat(glue("   Val wMAPE : {percent(wm_val,  accuracy = 0.01)}\n"))
+  cat(glue("   Test wMAPE: {percent(wm_test, accuracy = 0.01)}\n"))
+
+  # ── Change 5: Specials override — replace with seasonal baseline if it helps
+  # Specials have intermittent, event-driven demand where lags are weak anchors.
+  # Test on val first — only apply to test if val wMAPE actually improves.
+  val_override <- val_scored |>
+    mutate(predicted = if_else(
+      category == "Specials",
+      coalesce(prior_year_avg, combo_mean) |> pmax(0),
+      predicted
+    ))
+  wm_val_override <- score_wmape(val_override)
+  cat(glue("   Val wMAPE with Specials override: {percent(wm_val_override, accuracy = 0.01)}\n"))
+
+  if (wm_val_override < wm_val) {
+    test_scored <- test_scored |>
+      mutate(predicted = if_else(
+        category == "Specials",
+        coalesce(prior_year_avg, combo_mean) |> pmax(0),
+        predicted
+      ))
+    wm_test <- score_wmape(test_scored)
+    wm_val  <- wm_val_override
+    cat(glue("   ✓ Specials override applied — new val wMAPE: {percent(wm_val, accuracy = 0.01)}\n"))
+  } else {
+    cat(glue("   Specials override did not help val — skipped.\n"))
+  }
+
+  # ── Collect ───────────────────────────────────────────────────────────────
+  all_results <- bind_rows(
+    all_results,
+    tibble(
+      variant         = v_label,
+      train_rows      = nrow(train),
+      val_wmape       = wm_val,
+      test_wmape      = wm_test,
+      val_vs_baseline = wm_val - val_baseline_wmape
+    )
+  )
+  all_val_scored <- bind_rows(all_val_scored, val_scored)
+
+  # ── Save submission ───────────────────────────────────────────────────────
+  submission <- test_scored |>
+    select(date, restaurant_id, menu_item_id,
+           predicted_quantity = predicted) |>
+    mutate(date               = as.character(date),
+           predicted_quantity = round(predicted_quantity, 4)) |>
+    arrange(date, restaurant_id, menu_item_id)
+
+  stopifnot("Submission must be 69,000 rows" = nrow(submission) == 69000)
+  out_path <- glue("data/submission_lgbm_{v_label}.csv")
+  write_csv(submission, out_path)
+  cat(glue("   Saved: {out_path}\n"))
+
+  # keep dropped fit for diagnostics
+  if (v_label == "dropped") best_model_fit <- lgbm_fit
+}
+
+cat("\n── All variants complete ─────────────────────────────────\n")
+```
+
+---
+
+## 6. Comparison Scorecard
+
+```{r}
+#| label: scorecard
+
+scorecard <- bind_rows(
+  tibble(
+    variant         = "baseline (prior_year_avg)",
+    train_rows      = NA_integer_,
+    val_wmape       = val_baseline_wmape,
+    test_wmape      = test_baseline_wmape,
+    val_vs_baseline = 0
+  ),
+  all_results
+) |>
+  mutate(
+    val_pct        = percent(val_wmape,        accuracy = 0.01),
+    test_pct       = percent(test_wmape,        accuracy = 0.01),
+    vs_baseline_pp = percent(val_vs_baseline,   accuracy = 0.01)
+  )
+
+scorecard |>
+  select(variant, train_rows, val_pct, test_pct, vs_baseline_pp) |>
+  print()
+```
+
+```{r}
+#| label: scorecard-plot
+#| fig-width: 10
+#| fig-height: 4
+
+scorecard |>
+  filter(variant != "baseline (prior_year_avg)") |>
+  pivot_longer(c(val_wmape, test_wmape),
+               names_to = "split", values_to = "wmape") |>
+  mutate(
+    split   = if_else(split == "val_wmape",
+                      "Val (Sep 2025)", "Test (Oct-Dec 2025)"),
+    variant = fct_reorder(variant, wmape)
+  ) |>
+  ggplot(aes(x = variant, y = wmape, fill = split)) +
+  geom_col(position = "dodge", width = 0.6) +
+  geom_hline(yintercept = val_baseline_wmape,
+             linetype = "dashed", color = "grey40", linewidth = 0.8) +
+  geom_text(aes(label = percent(wmape, accuracy = 0.01)),
+            position = position_dodge(width = 0.6),
+            vjust = -0.4, size = 3.2) +
+  annotate("text", x = 0.55, y = val_baseline_wmape + 0.003,
+           label = glue("Baseline {percent(val_baseline_wmape, accuracy = 0.01)}"),
+           hjust = 0, size = 3, color = "grey40") +
+  scale_y_continuous(labels = percent_format(accuracy = 0.1),
+                     expand = expansion(mult = c(0, 0.12))) +
+  scale_fill_manual(values = c("Val (Sep 2025)"      = "#3B82C4",
+                                "Test (Oct-Dec 2025)" = "#6B7FA3")) +
+  labs(
+    title    = "LightGBM wMAPE — all three training variants",
+    subtitle = "Dashed line = prior_year_avg baseline",
+    x = NULL, y = "wMAPE", fill = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.major.x = element_blank(),
+        legend.position    = "top")
+```
+
+---
+
+## 7. Feature Importance
+
+Uses the `dropped` variant — rankings are identical across all three.
+
+```{r}
+#| label: feature-importance
+#| fig-width: 9
+#| fig-height: 8
+
+best_model_fit$fit |>
+  lightgbm::lgb.importance(percentage = TRUE) |>
+  as_tibble() |>
+  slice_max(Gain, n = 25) |>
+  mutate(Feature = fct_reorder(Feature, Gain)) |>
+  ggplot(aes(x = Gain, y = Feature)) +
+  geom_col(fill = "#3B82C4", width = 0.7) +
+  scale_x_continuous(labels = percent_format(accuracy = 0.1)) +
+  labs(
+    title    = "LightGBM feature importance — dropped variant",
+    subtitle = "Top 25 features by gain",
+    x = "Gain (%)", y = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.major.y = element_blank())
+```
+
+---
+
+## 8. Diagnostics — Val Set (dropped variant)
+
+```{r}
+#| label: residual-plots
+#| fig-width: 12
+#| fig-height: 5
+
+val_diag <- all_val_scored |>
+  filter(variant == "dropped", !is.na(quantity), quantity > 0) |>
+  mutate(
+    abs_pct_error = abs(quantity - predicted) / quantity,
+    residual      = quantity - predicted
+  )
+
+p1 <- val_diag |>
+  ggplot(aes(x = predicted, y = residual)) +
+  geom_point(alpha = 0.15, size = 1) +
+  geom_hline(yintercept = 0, color = "red", linewidth = 0.8) +
+  labs(title = "Residuals vs Predicted — Val (dropped)",
+       x = "Predicted", y = "Residual") +
+  theme_minimal(base_size = 11)
+
+p2 <- val_diag |>
+  mutate(pct_error_capped = pmin(abs_pct_error, 1)) |>
+  ggplot(aes(x = pct_error_capped)) +
+  geom_histogram(bins = 50, fill = "#3B82C4", color = "white") +
+  scale_x_continuous(labels = percent_format()) +
+  labs(title = "Distribution of |% Error| — Val (capped at 100%)",
+       x = "Absolute % Error", y = "Count") +
+  theme_minimal(base_size = 11)
+
+p1 + p2
+
+cat("Median |% error|  :", percent(median(val_diag$abs_pct_error), accuracy = 0.1), "\n")
+cat("90th pct |% error|:", percent(quantile(val_diag$abs_pct_error, 0.9), accuracy = 0.1), "\n")
+```
+
+```{r}
+#| label: wmape-by-category
+#| fig-width: 10
+#| fig-height: 4
+
+best_val_wmape <- all_results |>
+  filter(variant == "dropped") |>
+  pull(val_wmape)
+
+all_val_scored |>
+  filter(variant == "dropped", !is.na(quantity), quantity > 0) |>
+  group_by(category) |>
+  summarise(wmape  = wmape(quantity, predicted),
+            volume = sum(quantity), .groups = "drop") |>
+  mutate(category = fct_reorder(category, wmape),
+         flag     = wmape > best_val_wmape + 0.01) |>
+  ggplot(aes(x = category, y = wmape, fill = flag)) +
+  geom_col(width = 0.7) +
+  geom_hline(yintercept = best_val_wmape,
+             linetype = "dashed", color = "grey40") +
+  scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
+  scale_fill_manual(values = c("FALSE" = "#3B82C4", "TRUE" = "#E05C5C"),
+                    guide = "none") +
+  labs(title = "wMAPE by category — LightGBM (dropped) Val",
+       subtitle = "Red = more than 1pp above overall",
+       x = NULL, y = "wMAPE") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.major.x = element_blank())
+```
+
+```{r}
+#| label: wmape-by-restaurant
+#| fig-width: 10
+#| fig-height: 4
+
+all_val_scored |>
+  filter(variant == "dropped", !is.na(quantity), quantity > 0) |>
+  group_by(restaurant_id) |>
+  summarise(wmape  = wmape(quantity, predicted),
+            volume = sum(quantity), .groups = "drop") |>
+  mutate(restaurant_id = fct_reorder(restaurant_id, wmape),
+         flag          = wmape > best_val_wmape + 0.01) |>
+  ggplot(aes(x = restaurant_id, y = wmape, fill = flag)) +
+  geom_col(width = 0.7) +
+  geom_hline(yintercept = best_val_wmape,
+             linetype = "dashed", color = "grey40") +
+  scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
+  scale_fill_manual(values = c("FALSE" = "#3B82C4", "TRUE" = "#E05C5C"),
+                    guide = "none") +
+  labs(title = "wMAPE by restaurant — LightGBM (dropped) Val",
+       subtitle = "Red = more than 1pp above overall",
+       x = NULL, y = "wMAPE") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.major.x = element_blank())
+```
+
+---
+
+## 9. Best Submission
+
+Automatically selects the variant with the lowest val wMAPE.
+
+```{r}
+#| label: best-submission
+
+best_variant <- all_results |>
+  slice_min(val_wmape, n = 1) |>
+  pull(variant)
+
+best_val  <- all_results |> filter(variant == best_variant) |> pull(val_wmape)
+best_test <- all_results |> filter(variant == best_variant) |> pull(test_wmape)
+best_path <- glue("data/submission_lgbm_{best_variant}.csv")
+
+cat(glue("Best variant  : {best_variant}\n"))
+cat(glue("Val wMAPE     : {percent(best_val,  accuracy = 0.01)}\n"))
+cat(glue("Test wMAPE    : {percent(best_test, accuracy = 0.01)}\n"))
+cat(glue("Submission    : {best_path}\n"))
+
+# Confirm 69,000 rows
+final_sub <- read_csv(best_path, show_col_types = FALSE)
+stopifnot("Must be 69,000 rows" = nrow(final_sub) == 69000)
+cat(glue("Row count     : {nrow(final_sub)} ✓\n"))
+```

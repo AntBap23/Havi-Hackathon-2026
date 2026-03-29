@@ -1,0 +1,339 @@
+---
+title: "01 — Baseline Models"
+author: "Mario"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+library(tidyverse)
+library(scales)
+library(glue)
+```
+
+---
+
+## Purpose
+
+Establishes the **honest performance floor** before any ML model runs.
+Every model in `models/02_*` and beyond must beat these numbers to justify
+its complexity.
+
+Two baselines are evaluated:
+
+| Baseline | Logic |
+|---|---|
+| `prior_year_avg` | Mean quantity for same restaurant × item × month × DOW from training history |
+| `same_dow_mean` | Mean of the 4 most recent same-weekday observations (lags 7/14/21/28) |
+
+Both are already precomputed as feature columns by `00_data_prep.qmd` —
+no model fitting required here.
+
+---
+
+## 1. Load Splits
+
+```{r}
+#| label: load-splits
+
+cfg  <- readRDS("data/prep_config.rds")
+val  <- read_csv("data/val.csv",  show_col_types = FALSE)
+test <- read_csv("data/test.csv", show_col_types = FALSE)
+
+FEATURES <- cfg$FEATURES
+TARGET   <- cfg$TARGET
+
+# Training variant — baselines don't fit a model, but we load one so the
+# pattern is consistent and comparable with downstream notebooks
+train <- read_csv("data/train_dropped.csv", show_col_types = FALSE)
+
+glue("train: {nrow(train)} rows | val: {nrow(val)} rows | test: {nrow(test)} rows")
+```
+
+---
+
+## 2. wMAPE Helper
+
+This exact function is used in every model notebook. Do not modify it.
+
+```{r}
+#| label: wmape-helper
+
+# wMAPE: sum(|actual - predicted|) / sum(actual)
+# Only scores rows where actual > 0 and is not NA
+wmape <- function(actual, predicted) {
+  mask <- !is.na(actual) & actual > 0
+  sum(abs(actual[mask] - predicted[mask])) / sum(actual[mask])
+}
+
+# Convenience: score a dataframe that has columns `quantity` and `predicted`
+score_wmape <- function(df) {
+  wmape(df$quantity, df$predicted)
+}
+```
+
+---
+
+## 3. Baseline 1 — Prior-Year Average
+
+Uses the seasonal average from the same restaurant × item × month ×
+day-of-week in prior training years. This is the strongest naive anchor
+and the top feature by gain in every LightGBM experiment run so far.
+
+```{r}
+#| label: baseline-prior-year
+
+val_b1 <- val |>
+  mutate(predicted = coalesce(prior_year_avg, combo_mean)) |>
+  mutate(predicted = pmax(predicted, 0))
+
+test_b1 <- test |>
+  mutate(predicted = coalesce(prior_year_avg, combo_mean)) |>
+  mutate(predicted = pmax(predicted, 0))
+
+wmape_val_b1  <- score_wmape(val_b1)
+wmape_test_b1 <- score_wmape(test_b1)
+
+glue("Baseline 1 — prior_year_avg")
+glue("  Val  wMAPE (Sep 2025):     {percent(wmape_val_b1,  accuracy = 0.01)}")
+glue("  Test wMAPE (Oct-Dec 2025): {percent(wmape_test_b1, accuracy = 0.01)}")
+```
+
+---
+
+## 4. Baseline 2 — Same Day-of-Week Mean
+
+Uses the mean of the 4 most recent same-weekday observations. More
+reactive to recent demand shifts than `prior_year_avg`, but noisier.
+
+```{r}
+#| label: baseline-dow-mean
+
+val_b2 <- val |>
+  mutate(predicted = coalesce(same_dow_mean, prior_year_avg, combo_mean)) |>
+  mutate(predicted = pmax(predicted, 0))
+
+test_b2 <- test |>
+  mutate(predicted = coalesce(same_dow_mean, prior_year_avg, combo_mean)) |>
+  mutate(predicted = pmax(predicted, 0))
+
+wmape_val_b2  <- score_wmape(val_b2)
+wmape_test_b2 <- score_wmape(test_b2)
+
+glue("Baseline 2 — same_dow_mean")
+glue("  Val  wMAPE (Sep 2025):     {percent(wmape_val_b2,  accuracy = 0.01)}")
+glue("  Test wMAPE (Oct-Dec 2025): {percent(wmape_test_b2, accuracy = 0.01)}")
+```
+
+---
+
+## 5. Baseline 3 — Blended (50/50)
+
+Simple equal-weight blend of both baselines. Often more stable than
+either alone because the two signals have different error profiles.
+
+```{r}
+#| label: baseline-blend
+
+val_b3 <- val |>
+  mutate(
+    pred_b1   = coalesce(prior_year_avg, combo_mean),
+    pred_b2   = coalesce(same_dow_mean, prior_year_avg, combo_mean),
+    predicted = pmax((pred_b1 + pred_b2) / 2, 0)
+  )
+
+test_b3 <- test |>
+  mutate(
+    pred_b1   = coalesce(prior_year_avg, combo_mean),
+    pred_b2   = coalesce(same_dow_mean, prior_year_avg, combo_mean),
+    predicted = pmax((pred_b1 + pred_b2) / 2, 0)
+  )
+
+wmape_val_b3  <- score_wmape(val_b3)
+wmape_test_b3 <- score_wmape(test_b3)
+
+glue("Baseline 3 — 50/50 blend")
+glue("  Val  wMAPE (Sep 2025):     {percent(wmape_val_b3,  accuracy = 0.01)}")
+glue("  Test wMAPE (Oct-Dec 2025): {percent(wmape_test_b3, accuracy = 0.01)}")
+```
+
+---
+
+## 6. Scorecard
+
+```{r}
+#| label: scorecard
+
+scorecard <- tibble(
+  model        = c("prior_year_avg", "same_dow_mean", "50/50 blend"),
+  train_data   = "n/a — no fitting",
+  val_wmape    = c(wmape_val_b1,  wmape_val_b2,  wmape_val_b3),
+  test_wmape   = c(wmape_test_b1, wmape_test_b2, wmape_test_b3)
+) |>
+  mutate(
+    val_wmape_pct  = percent(val_wmape,  accuracy = 0.01),
+    test_wmape_pct = percent(test_wmape, accuracy = 0.01)
+  )
+
+scorecard |>
+  select(model, train_data, val_wmape_pct, test_wmape_pct) |>
+  print()
+```
+
+```{r}
+#| label: scorecard-plot
+#| fig-width: 9
+#| fig-height: 4
+
+scorecard |>
+  pivot_longer(c(val_wmape, test_wmape),
+               names_to = "split", values_to = "wmape") |>
+  mutate(
+    split = if_else(split == "val_wmape", "Val (Sep 2025)", "Test (Oct-Dec 2025)"),
+    model = fct_reorder(model, wmape)
+  ) |>
+  ggplot(aes(x = model, y = wmape, fill = split)) +
+  geom_col(position = "dodge", width = 0.6) +
+  geom_text(aes(label = percent(wmape, accuracy = 0.01)),
+            position = position_dodge(width = 0.6),
+            vjust = -0.4, size = 3.2) +
+  scale_y_continuous(labels = percent_format(accuracy = 0.1),
+                     expand = expansion(mult = c(0, 0.12))) +
+  scale_fill_manual(values = c("Val (Sep 2025)" = "#3B82C4",
+                                "Test (Oct-Dec 2025)" = "#6B7FA3")) +
+  labs(
+    title = "Baseline wMAPE — Val & Test",
+    subtitle = "These are the numbers every downstream model must beat",
+    x = NULL, y = "wMAPE", fill = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.major.x = element_blank(),
+        legend.position    = "top")
+```
+
+---
+
+## 7. Error Breakdown — Val Set
+
+Understand where the baseline fails before reaching for a model.
+
+```{r}
+#| label: error-by-category
+#| fig-width: 10
+#| fig-height: 4
+
+val_b1 |>
+  filter(!is.na(quantity), quantity > 0) |>
+  group_by(category) |>
+  summarise(
+    wmape  = wmape(quantity, predicted),
+    volume = sum(quantity),
+    .groups = "drop"
+  ) |>
+  mutate(
+    category = fct_reorder(category, wmape),
+    flag     = wmape > wmape_val_b1 + 0.01
+  ) |>
+  ggplot(aes(x = category, y = wmape, fill = flag)) +
+  geom_col(width = 0.7) +
+  geom_hline(yintercept = wmape_val_b1, linetype = "dashed", color = "grey40") +
+  scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
+  scale_fill_manual(values = c("FALSE" = "#3B82C4", "TRUE" = "#E05C5C"),
+                    guide = "none") +
+  labs(
+    title    = "Baseline 1 (prior_year_avg) wMAPE by category — Val",
+    subtitle  = "Red = more than 1pp above overall baseline",
+    x = NULL, y = "wMAPE"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.major.x = element_blank())
+```
+
+```{r}
+#| label: error-by-restaurant
+#| fig-width: 10
+#| fig-height: 4
+
+val_b1 |>
+  filter(!is.na(quantity), quantity > 0) |>
+  group_by(restaurant_id) |>
+  summarise(
+    wmape  = wmape(quantity, predicted),
+    volume = sum(quantity),
+    .groups = "drop"
+  ) |>
+  mutate(
+    restaurant_id = fct_reorder(restaurant_id, wmape),
+    flag          = wmape > wmape_val_b1 + 0.01
+  ) |>
+  ggplot(aes(x = restaurant_id, y = wmape, fill = flag)) +
+  geom_col(width = 0.7) +
+  geom_hline(yintercept = wmape_val_b1, linetype = "dashed", color = "grey40") +
+  scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
+  scale_fill_manual(values = c("FALSE" = "#3B82C4", "TRUE" = "#E05C5C"),
+                    guide = "none") +
+  labs(
+    title    = "Baseline 1 (prior_year_avg) wMAPE by restaurant — Val",
+    subtitle  = "Red = more than 1pp above overall baseline",
+    x = NULL, y = "wMAPE"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.major.x = element_blank())
+```
+
+---
+
+## 8. Best Baseline Submission
+
+Write the best-performing baseline as a valid submission file in case
+it is needed as a fallback.
+
+```{r}
+#| label: write-submission
+
+# Use whichever baseline scored best on val
+best_baseline <- list(b1 = wmape_val_b1, b2 = wmape_val_b2, b3 = wmape_val_b3)
+best_name     <- names(which.min(unlist(best_baseline)))
+
+best_preds <- switch(best_name,
+  b1 = test_b1,
+  b2 = test_b2,
+  b3 = test_b3
+)
+
+submission_baseline <- best_preds |>
+  select(date, restaurant_id, menu_item_id, predicted_quantity = predicted)
+
+stopifnot(nrow(submission_baseline) == 69000)
+
+write_csv(submission_baseline,
+          glue("data/submission_baseline_{best_name}.csv"))
+
+glue("Saved: data/submission_baseline_{best_name}.csv ({nrow(submission_baseline)} rows)")
+glue("Best baseline val wMAPE: {percent(min(unlist(best_baseline)), accuracy = 0.01)}")
+```
+
+---
+
+## Summary
+
+```{r}
+#| label: final-summary
+
+scorecard |>
+  select(model, val_wmape_pct, test_wmape_pct) |>
+  arrange(val_wmape_pct) |>
+  print()
+
+cat("\nTarget to beat in 02_lightgbm.qmd: val wMAPE <",
+    percent(min(c(wmape_val_b1, wmape_val_b2, wmape_val_b3)), accuracy = 0.01), "\n")
+```
