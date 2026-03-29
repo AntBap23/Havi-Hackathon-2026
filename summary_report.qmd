@@ -33,7 +33,7 @@ library(patchwork)
 #| label: load-data
 #| echo: false
 
-df <- read_csv("qsr_demand_dataset.csv") |>
+df <- read_csv("data/qsr_demand_dataset.csv") |>
   filter(!is.na(quantity))
 ```
 
@@ -66,7 +66,7 @@ Missing count by year:
 ```{r}
 #| label: missing-by-year
 
-df_full <- read_csv("qsr_demand_dataset.csv")
+df_full <- read_csv("data/qsr_demand_dataset.csv")
 
 missing <- df_full |>
   filter(is.na(quantity))
