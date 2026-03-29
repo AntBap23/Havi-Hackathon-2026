@@ -1,0 +1,470 @@
+---
+title: "00 — Data Preparation & Leakage-Free Splits"
+author: "Mario"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+library(tidyverse)
+library(lubridate)
+```
+
+---
+
+## Purpose
+
+This notebook is the **single source of truth** for all data preparation.
+It runs once and writes standardized files to `data/` that every model
+notebook loads directly. Nothing downstream touches raw data or recomputes
+splits.
+
+**What this script produces:**
+
+| File | Description |
+|---|---|
+| `data/val.csv` | Sep 2025 — fixed, never changes |
+| `data/test.csv` | Oct–Dec 2025 — fixed, never changes |
+| `data/train_dropped.csv` | Training rows with null quantity dropped |
+| `data/train_imputed_combo_median.csv` | Null quantity filled with combo (restaurant × item) median |
+| `data/train_imputed_dow_median.csv` | Null quantity filled with same day-of-week median per combo |
+
+Val and test **always score against real quantities** — the dataset contains
+actuals through Dec 31 2025. The training variant is the only variable
+you change when comparing models.
+
+---
+
+## 1. Config
+
+```{r}
+#| label: config
+
+# ── Date boundaries ───────────────────────────────────────────────────────────
+TRAIN_START <- as.Date("2021-01-01")
+TRAIN_END   <- as.Date("2025-08-31")
+VAL_START   <- as.Date("2025-09-01")
+VAL_END     <- as.Date("2025-09-30")
+TEST_START  <- as.Date("2025-10-01")
+TEST_END    <- as.Date("2025-12-31")
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+DATA_IN  <- "data/qsr_demand_dataset.csv"
+DATA_OUT <- "data/"
+```
+
+---
+
+## 2. Load Raw Data
+
+```{r}
+#| label: load-raw
+
+df_raw <- read_csv(DATA_IN, show_col_types = FALSE) |>
+  mutate(date = as.Date(date)) |>
+  arrange(restaurant_id, menu_item_id, date)
+
+glue::glue("Rows: {nrow(df_raw)} | Date range: {min(df_raw$date)} to {max(df_raw$date)}")
+glue::glue("Missing quantity: {sum(is.na(df_raw$quantity))} ({round(mean(is.na(df_raw$quantity))*100,2)}%)")
+```
+
+---
+
+## 3. Raw Splits by Date
+
+Split first — before any cleaning or feature engineering. Val and test
+are frozen from this point forward.
+
+```{r}
+#| label: raw-splits
+
+raw_train <- df_raw |> filter(date >= TRAIN_START, date <= TRAIN_END)
+raw_val   <- df_raw |> filter(date >= VAL_START,   date <= VAL_END)
+raw_test  <- df_raw |> filter(date >= TEST_START,  date <= TEST_END)
+
+cat(
+  "raw_train:", nrow(raw_train), "rows |",
+    sum(is.na(raw_train$quantity)), "null qty\n",
+  "raw_val:  ", nrow(raw_val),   "rows |",
+    sum(is.na(raw_val$quantity)),   "null qty\n",
+  "raw_test: ", nrow(raw_test),  "rows |",
+    sum(is.na(raw_test$quantity)),  "null qty\n"
+)
+```
+
+---
+
+## 4. Calendar Features
+
+These are always safe — every value is known at prediction time.
+Computed once on the full dataset so val and test rows get the same columns.
+
+```{r}
+#| label: calendar-features
+
+add_calendar_features <- function(df) {
+  df |>
+    mutate(
+      day_of_year       = yday(date),
+      day_of_month      = mday(date),
+      week_of_year      = isoweek(date),
+      quarter           = quarter(date),
+      days_in_month     = days_in_month(date),
+      days_to_month_end = as.integer(days_in_month - day_of_month),
+      days_from_start   = as.integer(date - as.Date("2021-01-01")),
+      # Fourier terms — smooth annual seasonality
+      sin_doy_1 = sin(2 * pi * 1 * day_of_year / 365.25),
+      cos_doy_1 = cos(2 * pi * 1 * day_of_year / 365.25),
+      sin_doy_2 = sin(2 * pi * 2 * day_of_year / 365.25),
+      cos_doy_2 = cos(2 * pi * 2 * day_of_year / 365.25),
+      # Fourier terms — smooth weekly seasonality
+      sin_dow   = sin(2 * pi * day_of_week_num / 7),
+      cos_dow   = cos(2 * pi * day_of_week_num / 7)
+    ) |>
+    select(-days_in_month)
+}
+
+df_cal <- df_raw |> add_calendar_features()
+```
+
+---
+
+## 5. Leakage-Free Lag & Rolling Features
+
+Lags and rolling windows look **backward only** — a lag_7 on Sep 1 pulls
+from Aug 25, which is always in the training period. Rolling windows are
+anchored at lag-7 so the most recent 7 days are never included.
+
+All rows (train, val, test) get these features computed from the full
+sorted series. There is no leakage because `lag()` and `rollmean()`
+only see past values by construction.
+
+```{r}
+#| label: lag-features
+
+add_lag_features <- function(df) {
+  df |>
+    arrange(restaurant_id, menu_item_id, date) |>
+    group_by(restaurant_id, menu_item_id) |>
+    mutate(
+      # ── Point lags ──────────────────────────────────────────────────────────
+      lag_7   = lag(quantity, 7),
+      lag_14  = lag(quantity, 14),
+      lag_21  = lag(quantity, 21),
+      lag_28  = lag(quantity, 28),
+      lag_364 = lag(quantity, 364),
+
+      # ── Same day-of-week lags (most meaningful for weekly demand patterns) ──
+      same_dow_lag1 = lag(quantity, 7),   # same DOW, 1 week ago
+      same_dow_lag2 = lag(quantity, 14),  # same DOW, 2 weeks ago
+      same_dow_lag3 = lag(quantity, 21),  # same DOW, 3 weeks ago
+      same_dow_mean = (lag(quantity, 7) + lag(quantity, 14) +
+                       lag(quantity, 21) + lag(quantity, 28)) / 4,
+
+      # ── Rolling windows anchored at lag-7 (no leakage into recent days) ────
+      # shift by 7 first, then roll forward over that shifted series
+      roll_mean_7  = lag(quantity, 7) |>
+                       (\(x) zoo::rollmeanr(x, k = 7,  fill = NA, na.rm = TRUE))(),
+      roll_mean_14 = lag(quantity, 7) |>
+                       (\(x) zoo::rollmeanr(x, k = 14, fill = NA, na.rm = TRUE))(),
+      roll_mean_28 = lag(quantity, 7) |>
+                       (\(x) zoo::rollmeanr(x, k = 28, fill = NA, na.rm = TRUE))(),
+      roll_std_28  = lag(quantity, 7) |>
+                       (\(x) zoo::rollapply(x, width = 28, FUN = sd,
+                                            fill = NA, align = "right",
+                                            na.rm = TRUE))(),
+      roll_max_28  = lag(quantity, 7) |>
+                       (\(x) zoo::rollapply(x, width = 28, FUN = max,
+                                            fill = NA, align = "right",
+                                            na.rm = TRUE))()
+    ) |>
+    ungroup()
+}
+
+df_feats <- df_cal |> add_lag_features()
+
+cat("Lag/rolling features added. NAs in lag_7:",
+    sum(is.na(df_feats$lag_7)), "\n")
+```
+
+---
+
+## 6. Seasonal Baseline Feature (`prior_year_avg`)
+
+`prior_year_avg` is the average quantity for the same restaurant × item ×
+month × day-of-week, computed **from training rows only**. This is the
+strongest single feature from the EDA (dominates LightGBM gain).
+
+It is computed once from `raw_train` and then joined to all rows —
+including val and test. No leakage because it only uses history up to
+Aug 31 2025.
+
+```{r}
+#| label: prior-year-avg
+
+# Compute from training period only (non-null rows)
+prior_year_avg <- raw_train |>
+  filter(!is.na(quantity)) |>
+  mutate(month = month(date)) |>
+  group_by(restaurant_id, menu_item_id, month, day_of_week_num) |>
+  summarise(prior_year_avg = mean(quantity, na.rm = TRUE), .groups = "drop")
+
+# Combo-level fallback (for month × DOW combos with no training history)
+combo_mean <- raw_train |>
+  filter(!is.na(quantity)) |>
+  group_by(restaurant_id, menu_item_id) |>
+  summarise(combo_mean = mean(quantity, na.rm = TRUE), .groups = "drop")
+
+# Join to all rows
+df_feats <- df_feats |>
+  mutate(month = month(date)) |>
+  left_join(prior_year_avg, by = c("restaurant_id", "menu_item_id",
+                                    "month", "day_of_week_num")) |>
+  left_join(combo_mean,     by = c("restaurant_id", "menu_item_id")) |>
+  # Fill any remaining NAs in prior_year_avg with combo_mean
+  mutate(prior_year_avg = coalesce(prior_year_avg, combo_mean))
+
+cat("prior_year_avg NAs remaining:", sum(is.na(df_feats$prior_year_avg)), "\n")
+```
+
+---
+
+## 7. Canonical Feature List
+
+Every model notebook imports this same list. Adding or removing a feature
+means changing it here once — all models inherit the change.
+
+```{r}
+#| label: feature-list
+
+FEATURES <- c(
+  # Calendar
+  "day_of_week_num", "is_weekend", "month", "quarter",
+  "day_of_month", "days_to_month_end", "week_of_year", "day_of_year",
+  "days_from_start",
+  # Fourier — annual and weekly seasonality
+  "sin_doy_1", "cos_doy_1", "sin_doy_2", "cos_doy_2",
+  "sin_dow",   "cos_dow",
+  # Lags
+  "lag_7", "lag_14", "lag_21", "lag_28", "lag_364",
+  # Rolling (anchored at lag-7)
+  "roll_mean_7", "roll_mean_14", "roll_mean_28",
+  "roll_std_28", "roll_max_28",
+  # Same day-of-week
+  "same_dow_lag1", "same_dow_lag2", "same_dow_lag3", "same_dow_mean",
+  # Seasonal baseline
+  "prior_year_avg", "combo_mean",
+  # Exogenous — known at prediction time
+  "unit_price", "avg_temp_f", "precip_inches",
+  "is_holiday", "is_special_event", "is_promotion"
+)
+
+TARGET <- "quantity"
+
+cat("Features:", length(FEATURES), "\n")
+cat(paste(FEATURES, collapse = ", "))
+```
+
+---
+
+## 8. Null Strategies — Training Only
+
+Three variants. Each applies a different strategy to the 0.4% of training
+rows with missing quantity, **then** caps outliers at the 99.5th percentile
+per combo (also training-only).
+
+Val and test are never modified.
+
+```{r}
+#| label: null-strategies
+
+# ── Helper: cap outliers at 99.5th percentile per combo (training only) ───────
+cap_outliers <- function(df) {
+  df |>
+    group_by(restaurant_id, menu_item_id) |>
+    mutate(
+      cap_995 = quantile(quantity, 0.995, na.rm = TRUE),
+      quantity = pmin(quantity, cap_995)
+    ) |>
+    ungroup() |>
+    select(-cap_995)
+}
+
+# Split the featured dataset by period
+train_feats <- df_feats |> filter(date >= TRAIN_START, date <= TRAIN_END)
+val_feats   <- df_feats |> filter(date >= VAL_START,   date <= VAL_END)
+test_feats  <- df_feats |> filter(date >= TEST_START,  date <= TEST_END)
+
+# ── Strategy 1: Drop null quantity rows ───────────────────────────────────────
+# Cleanest for lag features — no synthetic values ever enter the feature columns
+train_dropped <- train_feats |>
+  filter(!is.na(quantity)) |>
+  # Also drop lag warm-up period where lag_364 is still NA
+  # (first ~364 days per combo have no full-year lookback)
+  filter(!is.na(lag_364)) |>
+  cap_outliers()
+
+cat("train_dropped:   ", nrow(train_dropped), "rows |",
+    sum(is.na(train_dropped$quantity)), "null qty\n")
+
+# ── Strategy 2: Impute with combo median (restaurant × item) ─────────────────
+# Median computed from non-null training rows only — no test data used
+combo_median_fill <- raw_train |>
+  filter(!is.na(quantity)) |>
+  group_by(restaurant_id, menu_item_id) |>
+  summarise(combo_median = median(quantity, na.rm = TRUE), .groups = "drop")
+
+train_imputed_combo <- train_feats |>
+  left_join(combo_median_fill, by = c("restaurant_id", "menu_item_id")) |>
+  mutate(quantity = coalesce(quantity, combo_median)) |>
+  select(-combo_median) |>
+  filter(!is.na(lag_364)) |>
+  cap_outliers()
+
+cat("train_imputed_combo:", nrow(train_imputed_combo), "rows |",
+    sum(is.na(train_imputed_combo$quantity)), "null qty\n")
+
+# ── Strategy 3: Impute with same day-of-week median per combo ────────────────
+# More targeted — respects weekly demand patterns before filling
+dow_median_fill <- raw_train |>
+  filter(!is.na(quantity)) |>
+  group_by(restaurant_id, menu_item_id, day_of_week_num) |>
+  summarise(dow_median = median(quantity, na.rm = TRUE), .groups = "drop")
+
+train_imputed_dow <- train_feats |>
+  left_join(dow_median_fill,
+            by = c("restaurant_id", "menu_item_id", "day_of_week_num")) |>
+  mutate(quantity = coalesce(quantity, dow_median)) |>
+  select(-dow_median) |>
+  filter(!is.na(lag_364)) |>
+  cap_outliers()
+
+cat("train_imputed_dow:  ", nrow(train_imputed_dow), "rows |",
+    sum(is.na(train_imputed_dow$quantity)), "null qty\n")
+```
+
+---
+
+## 9. Verify Val & Test Are Untouched
+
+```{r}
+#| label: verify-splits
+
+# Val and test rows come from df_feats — features computed, quantity untouched
+cat("val  rows:", nrow(val_feats),  "| qty NAs:", sum(is.na(val_feats$quantity)),  "\n")
+cat("test rows:", nrow(test_feats), "| qty NAs:", sum(is.na(test_feats$quantity)), "\n")
+
+# Val should be scoreable — confirm quantity coverage
+val_coverage <- 1 - mean(is.na(val_feats$quantity))
+cat("Val quantity coverage:", scales::percent(val_coverage, accuracy = 0.01), "\n")
+
+# Test row count must be exactly 69,000
+stopifnot("Test must be exactly 69,000 rows" = nrow(test_feats) == 69000)
+cat("✓ test has exactly 69,000 rows\n")
+```
+
+---
+
+## 10. Write Splits to `data/`
+
+```{r}
+#| label: write-splits
+
+write_csv(train_dropped,      paste0(DATA_OUT, "train_dropped.csv"))
+write_csv(train_imputed_combo, paste0(DATA_OUT, "train_imputed_combo_median.csv"))
+write_csv(train_imputed_dow,   paste0(DATA_OUT, "train_imputed_dow_median.csv"))
+write_csv(val_feats,           paste0(DATA_OUT, "val.csv"))
+write_csv(test_feats,          paste0(DATA_OUT, "test.csv"))
+
+# Save canonical feature list and config for model notebooks to import
+config <- list(
+  FEATURES    = FEATURES,
+  TARGET      = TARGET,
+  TRAIN_END   = as.character(TRAIN_END),
+  VAL_START   = as.character(VAL_START),
+  VAL_END     = as.character(VAL_END),
+  TEST_START  = as.character(TEST_START),
+  TEST_END    = as.character(TEST_END)
+)
+saveRDS(config, paste0(DATA_OUT, "prep_config.rds"))
+
+cat("\n── Files written to data/ ────────────────────────────────\n")
+cat("  train_dropped.csv               →", nrow(train_dropped), "rows\n")
+cat("  train_imputed_combo_median.csv  →", nrow(train_imputed_combo), "rows\n")
+cat("  train_imputed_dow_median.csv    →", nrow(train_imputed_dow), "rows\n")
+cat("  val.csv                         →", nrow(val_feats), "rows\n")
+cat("  test.csv                        →", nrow(test_feats), "rows\n")
+cat("  prep_config.rds                 → feature list + date config\n")
+```
+
+---
+
+## 11. How to Use This in a Model Notebook
+
+Every model notebook in `models/` starts with exactly this:
+
+```r
+# ── Load standardized splits ──────────────────────────────────────────────────
+cfg   <- readRDS("data/prep_config.rds")
+val   <- read_csv("data/val.csv",   show_col_types = FALSE)
+test  <- read_csv("data/test.csv",  show_col_types = FALSE)
+
+# Pick ONE training variant — this is the only line that changes between runs
+train <- read_csv("data/train_dropped.csv", show_col_types = FALSE)
+# train <- read_csv("data/train_imputed_combo_median.csv", show_col_types = FALSE)
+# train <- read_csv("data/train_imputed_dow_median.csv",   show_col_types = FALSE)
+
+FEATURES <- cfg$FEATURES
+TARGET   <- cfg$TARGET
+
+# ── wMAPE helper (identical in every model notebook) ─────────────────────────
+wmape <- function(actual, predicted) {
+  mask <- !is.na(actual) & actual > 0
+  sum(abs(actual[mask] - predicted[mask])) / sum(actual[mask])
+}
+```
+
+When you change the training variant and re-run, the **only variable
+that changed** is the null strategy. Any wMAPE difference is attributable
+to that choice alone.
+
+---
+
+## Summary
+
+```{r}
+#| label: summary-table
+
+tibble(
+  file                 = c("train_dropped.csv",
+                            "train_imputed_combo_median.csv",
+                            "train_imputed_dow_median.csv",
+                            "val.csv",
+                            "test.csv"),
+  null_strategy        = c("Rows with null qty dropped",
+                            "Null qty → combo median (rest × item)",
+                            "Null qty → same-DOW median per combo",
+                            "Unchanged — score on non-null rows only",
+                            "Unchanged — all 69,000 rows"),
+  rows                 = c(nrow(train_dropped),
+                            nrow(train_imputed_combo),
+                            nrow(train_imputed_dow),
+                            nrow(val_feats),
+                            nrow(test_feats)),
+  features_from        = c("own history",
+                            "own history",
+                            "own history",
+                            "raw_train history",
+                            "raw_train history")
+) |>
+  print(n = Inf)
+```
