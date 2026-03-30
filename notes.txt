@@ -1,0 +1,1 @@
+Environment note: on macOS, LightGBM may require OpenMP. If you see an OpenMP/libomp import error, run `brew install libomp` and reinstall requirements.
