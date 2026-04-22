@@ -1,4 +1,4 @@
-# HAVI QSR Demand Forecasting — Hackathon 2026
+# HAVI QSR Demand Forecasting — Hackathon 2026 2nd Place
 
 Team repository for the **HAVI / NIU Quick Service Restaurant (QSR) Demand Forecasting Challenge**: predict daily item demand from history, calendar, weather, and promotions, then submit forecasts for the official holdout window.
 
