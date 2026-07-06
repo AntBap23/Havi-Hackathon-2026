@@ -1,102 +1,291 @@
-# HAVI QSR Demand Forecasting — Hackathon 2026 2nd Place
+# 🍔 QSR Demand Forecasting Platform
 
-Team repository for the **HAVI / NIU Quick Service Restaurant (QSR) Demand Forecasting Challenge**: predict daily item demand from history, calendar, weather, and promotions, then submit forecasts for the official holdout window.
+> A machine learning forecasting platform developed for the HAVI x Northern Illinois University Hackathon to predict restaurant demand using historical sales, weather, promotions, holidays, and calendar effects.
 
-See [`CONTEXT.txt`](CONTEXT.txt) for shared project assumptions, strategy, and non‑negotiables (no leakage, time-based validation, optimize for wMAPE).
-
----
-
-## Objective
-
-Forecast **`quantity`** for every **restaurant × menu item × day** in the holdout period:
-
-| Item | Detail |
-|------|--------|
-| **Holdout dates** | **2025-10-01** through **2025-12-31** |
-| **Submission rows** | **69,000** (92 days × 15 restaurants × 50 menu items) |
-| **Metric** | **wMAPE** (weighted mean absolute percentage error). **Lower is better.** |
-| **Scoring note** | Confirm the exact wMAPE definition with official rules; locally we track both a **global** wMAPE (Σ\|error\| / Σ actual) and notebook-style item-volume weighting where useful. |
-
-### Submission file format
-
-Columns (in order):
-
-`date` · `restaurant_id` · `menu_item_id` · `predicted_quantity`
-
-Example artifacts in this repo: `submission.csv` (root), `data/submissions/qsr_forecast_Anthony_model_submission.csv`.
+![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)
+![LightGBM](https://img.shields.io/badge/LightGBM-ML-green?style=for-the-badge)
+![Scikit Learn](https://img.shields.io/badge/scikit--learn-F7931E?style=for-the-badge&logo=scikitlearn&logoColor=white)
+![Pandas](https://img.shields.io/badge/Pandas-150458?style=for-the-badge&logo=pandas&logoColor=white)
 
 ---
 
-## Data
+# Overview
 
-- **Full history (typical workflow):** `qsr_demand_dataset.csv` — ~**1.37M** daily rows from **2021–2025**, **15** restaurants, **50** menu items, Midwest locations.  
-  Each row is one day for one restaurant–item; features include calendar, weather, holidays, events, and promotions (see `CONTEXT.txt` for column groups).
+Accurate demand forecasting is one of the most important challenges in supply chain and restaurant operations.
 
-- **Pre-split CSVs (optional / teammate workflow):** under `data/`:
+Overestimating demand increases food waste and inventory costs, while underestimating demand leads to stockouts, lost revenue, and poor customer experiences.
 
-  | Path | Role |
-  |------|------|
-  | `data/training/train_set.csv` | Training split |
-  | `data/validation/val_set.csv` | Validation split |
-  | `data/test/test_set.csv` | Test / holdout features |
-  | `data/submissions/` | Example or teammate submission files |
+This project was developed during the **HAVI x Northern Illinois University Demand Forecasting Hackathon**, where our team built a machine learning forecasting pipeline capable of predicting daily menu item demand across multiple restaurants.
 
-The raw competition file is large; keep it out of git if you use Git LFS or local-only copies—check your remote policy.
+Our solution combined feature engineering, exploratory analysis, time-series validation, and gradient boosting models to generate demand forecasts optimized for business performance.
+
+🥈 **2nd Place Overall**
 
 ---
 
-## Repository layout
+# Business Problem
 
-| Path | Purpose |
-|------|---------|
-| `CONTEXT.txt` | Hackathon context, dataset summary, team process, rules for modeling |
-| `EDA.ipynb` | Exploratory analysis |
-| `qsr_forecast.ipynb` | Main Python forecasting pipeline (baseline → features → LightGBM, time-based validation) |
-| `qsr_forecast (1).ipynb` | Alternate / evolved notebook (e.g. Colab-oriented workflow, blended baseline + GBM) |
-| `mario_eda.qmd` | Quarto EDA / narrative |
-| `charts/` | Plots and figures |
-| `models/` | Saved models (if committed) |
-| `requirements.txt` | Python dependencies |
-| `renv.lock`, `renv/`, `.Rprofile` | **R** reproducible environment ([renv](https://rstudio.github.io/renv/)) |
+Quick Service Restaurants (QSRs) require highly accurate demand forecasts to support inventory planning and operational efficiency.
+
+Traditional forecasting methods often struggle to capture changing customer behavior caused by:
+
+- Promotions
+- Holidays
+- Weather
+- Local events
+- Seasonal demand
+- Restaurant-specific purchasing patterns
+
+The objective was to build a forecasting model capable of accurately predicting daily demand while minimizing forecasting error using the competition's evaluation metric.
 
 ---
 
-## Setup
+# Project Objective
 
-### Python
+Forecast daily demand for every:
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+- Restaurant
+- Menu Item
+- Date
+
+across the official competition holdout period.
+
+Forecast Window
+
+**October 1, 2025 – December 31, 2025**
+
+Total Predictions
+
+**69,000 forecasts**
+
+Evaluation Metric
+
+**Weighted Mean Absolute Percentage Error (wMAPE)**
+
+Lower scores indicate more accurate business forecasts.
+
+---
+
+# Solution Architecture
+
+```
+Historical Restaurant Data
+        │
+        ▼
+Data Cleaning & Validation
+        │
+        ▼
+Exploratory Data Analysis
+        │
+        ▼
+Feature Engineering
+        │
+        ▼
+Time-Based Train / Validation Split
+        │
+        ▼
+LightGBM Forecasting Model
+        │
+        ▼
+Performance Evaluation
+        │
+        ▼
+Submission Generation
 ```
 
-Core stack: **pandas**, **numpy**, **LightGBM**, **scikit-learn**, **matplotlib**, **seaborn**, **ipykernel** (see `requirements.txt` for versions).
+---
 
-### R
+# Dataset
 
-From the repo root (with R installed):
+The forecasting dataset contains approximately **1.37 million historical observations** covering multiple years of restaurant operations.
 
-```r
-renv::restore()
-```
+The data includes:
 
-Uses `renv.lock` for pinned packages.
+- Daily sales
+- Restaurant information
+- Menu items
+- Weather
+- Holidays
+- Promotions
+- Calendar features
+- Local events
+
+Each observation represents a single menu item sold at a specific restaurant on a specific day.
 
 ---
 
-## Modeling principles (from `CONTEXT.txt`)
+# Machine Learning Pipeline
 
-1. **No future leakage** in features.
-2. **Time-based validation only** (e.g. hold out **September 2025** before forecasting Oct–Dec).
-3. **Optimize for wMAPE**, not generic point-accuracy alone.
-4. Prefer **interpretable, reproducible** pipelines over fragile complexity.
-5. Keep outputs **interoperable** (Python ↔ R) where both are used.
+## Exploratory Data Analysis
 
-Typical flow: strong baseline → time-aware features (lags, rolls, calendar, weather, events) → **LightGBM** (or similar) → validate on calendar holdout → retrain on all pre-forecast history → generate **69k** submission rows.
+Initial analysis focused on understanding demand behavior through:
+
+- Sales distributions
+- Seasonal trends
+- Restaurant comparisons
+- Category performance
+- Missing value analysis
+- Feature relationships
+
+---
+
+## Feature Engineering
+
+Features were engineered to capture historical purchasing behavior while avoiding data leakage.
+
+Examples include:
+
+- Lag features
+- Rolling averages
+- Calendar variables
+- Holiday indicators
+- Weather effects
+- Promotional activity
+- Restaurant characteristics
+
+---
+
+## Model Development
+
+The primary forecasting model used **LightGBM**, a gradient boosting framework well suited for structured business data.
+
+The model was selected because it:
+
+- Handles nonlinear relationships
+- Captures feature interactions
+- Performs well on tabular datasets
+- Trains efficiently
+- Provides feature importance for model interpretation
+
+---
+
+## Validation Strategy
+
+Rather than randomly splitting the data, the project used **time-based validation** to better simulate real-world forecasting.
+
+This approach ensures future observations are never used during model training, preventing information leakage.
+
+Validation emphasized business realism over maximizing leaderboard performance.
+
+---
+
+# Results
+
+🏆 **2nd Place — HAVI x NIU Demand Forecasting Hackathon**
+
+Key accomplishments included:
+
+- End-to-end forecasting workflow
+- Robust feature engineering
+- Time-aware validation
+- Business-focused evaluation
+- High-performing LightGBM model
+
+Performance was measured using **wMAPE**, a metric commonly used in supply chain planning because it prioritizes errors on high-volume products.
+
+---
+
+# Visualizations
+
+The repository includes visualizations for:
+
+- Feature Importance
+- Actual vs Predicted Demand
+- Residual Analysis
+- Category Performance
+- Restaurant Performance
+- Forecast Accuracy
+
+These analyses helped identify where the model performed well and where additional feature engineering could improve forecasts.
+
+---
+
+# Repository Structure
+
+```
+Havi-Hackathon-2026/
+
+├── data/
+│
+├── models/
+│
+├── charts/
+│
+├── docs/
+│
+├── notebooks/
+│
+├── reports/
+│
+├── requirements.txt
+│
+└── README.md
+```
+
+---
+
+# Skills Demonstrated
+
+- Machine Learning
+- Forecasting
+- Feature Engineering
+- Time Series Validation
+- Supply Chain Analytics
+- Predictive Modeling
+- Python
+- Pandas
+- LightGBM
+- Business Analytics
+- Data Visualization
+- Model Evaluation
+
+---
+
+# Lessons Learned
+
+This project strengthened my understanding of production-style forecasting workflows, including:
+
+- Designing realistic validation strategies
+- Preventing data leakage
+- Building interpretable machine learning models
+- Engineering business-driven features
+- Evaluating models using operational metrics
+- Translating forecasting results into business recommendations
+
+---
+
+# Future Improvements
+
+Potential enhancements include:
+
+- Hyperparameter optimization with Optuna
+- Model ensembling
+- Hierarchical forecasting
+- Deep learning forecasting models
+- Automated retraining pipeline
+- MLflow experiment tracking
+- Cloud deployment
+- Interactive forecasting dashboard
+
+---
+
+# About Me
+
+I'm passionate about solving business problems using analytics, experimentation, AI, and machine learning.
+
+My interests include:
+
+- Product Analytics
+- Forecasting
+- Supply Chain Analytics
+- AI-powered Decision Support
+- Analytics Engineering
+- Experimentation
+
+Feel free to connect if you'd like to discuss forecasting, analytics engineering, or machine learning.
 
 ---
 
 ## License
 
-[`LICENSE`](LICENSE) — MIT (see file for copyright holder).
+MIT License
